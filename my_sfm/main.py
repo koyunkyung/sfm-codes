@@ -12,7 +12,7 @@ def main():
     
     # Configuration
     image_dir = 'data/frames'
-    output_dir = 'results/my_sfm'
+    output_dir = 'results/my_sfm2'
     
     # Step 0: Feature Check (optional but recommended)
     print("STEP 0: Feature Matching Verification")

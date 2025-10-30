@@ -7,17 +7,25 @@ from pathlib import Path
 
 
 class SfMModel:
-    """Incremental Structure from Motion Model"""
+    """
+    Incremental Structure from Motion - Following Lecture 8
+    
+    Pipeline:
+    1. Initialize from two views (Lecture 5: Essential Matrix)
+    2. Iteratively add new cameras (Lecture 4: PnP)
+    3. Triangulate new points (Lecture 6: DLT Triangulation)
+    4. Bundle Adjustment (Lecture 8: Non-linear refinement)
+    """
     
     def __init__(self):
-        self.cameras = {}  # cam_idx -> {'R': R, 't': t, 'K': K}
-        self.points3D = {}  # pt_id -> {'xyz': [x,y,z], 'rgb': [r,g,b], 'obs': [(cam_idx, pt2d)]}
+        self.cameras = {}
+        self.points3D = {}
         self.next_point_id = 0
         self.registered_images = set()
-        self.kp_to_pt3d = {}  # (cam_idx, kp_idx) -> pt_id
+        self.kp_to_pt3d = {}
     
     def initialize_intrinsics(self, image_shape):
-        """Initialize camera intrinsics from image size"""
+        """Initialize camera intrinsics - Lecture 4"""
         h, w = image_shape[:2]
         focal = max(w, h) * 1.2
         cx, cy = w / 2.0, h / 2.0
@@ -30,32 +38,20 @@ class SfMModel:
         
         return K
     
+    # ============================================================================
+    # 1. INITIAL POSE ESTIMATION (Lecture 5: Epipolar Geometry)
+    # ============================================================================
+    
     def estimate_pose_from_essential(self, pts1, pts2, K):
         """
-        Estimate relative pose between two views using Essential matrix
+        Lecture 5: Essential Matrix E = [t]_x R
+        5-point algorithm + decomposition
         
-        Process:
-        1. Normalize points using initial K estimate
-        2. Find Essential matrix E = [t]_x R (uses 5-point algorithm internally)
-        3. Decompose E to recover R and t
-        
-        Note: K is an initial estimate that will be refined via bundle adjustment
-        
-        Args:
-            pts1, pts2: Matched 2D points (Nx2)
-            K: Initial camera intrinsics estimate
-        
-        Returns:
-            R: Rotation matrix (3x3)
-            t: Translation vector (3x1)
-            mask: Inlier mask (boolean array)
+        Returns R, t with UNIT SCALE (scale ambiguity)
         """
-        # Normalize points with initial K estimate
         pts1_norm = cv2.undistortPoints(pts1.reshape(-1, 1, 2), K, None).reshape(-1, 2)
         pts2_norm = cv2.undistortPoints(pts2.reshape(-1, 1, 2), K, None).reshape(-1, 2)
         
-        # Find Essential matrix using RANSAC
-        # Note: cv2.findEssentialMat uses 5-point algorithm internally
         E, mask = cv2.findEssentialMat(
             pts1_norm, pts2_norm,
             focal=1.0, pp=(0., 0.),
@@ -67,63 +63,88 @@ class SfMModel:
         if E is None:
             return None, None, None
         
-        # Recover pose from Essential matrix
         _, R, t, mask_pose = cv2.recoverPose(E, pts1_norm, pts2_norm)
         
-        # Combine masks
         mask_essential = mask.ravel().astype(bool)
         mask_recover = mask_pose.ravel().astype(bool)
         final_mask = mask_essential & mask_recover
         
         return R, t, final_mask
     
-    def triangulate_points(self, pts1, pts2, P1, P2):
-        """
-        Triangulate 3D points from two views
-        Using DLT (Direct Linear Transform) as in lecture
-        """
-        # Convert to correct format for cv2.triangulatePoints
-        # Input should be 2xN arrays
+    def triangulate_points_dlt(self, pts1, pts2, P1, P2):
         pts1 = np.asarray(pts1, dtype=np.float32).reshape(-1, 2)
         pts2 = np.asarray(pts2, dtype=np.float32).reshape(-1, 2)
+        n = len(pts1)
         
-        # Triangulate using OpenCV (implements DLT)
-        # cv2.triangulatePoints expects 2xN format
-        points_4d = cv2.triangulatePoints(P1, P2, pts1.T, pts2.T)
-        points_3d = (points_4d[:3] / points_4d[3]).T
+        points_3d = []
         
-        return points_3d
+        for i in range(n):
+            # DLT: Construct A matrix for each point
+            x1, y1 = pts1[i]
+            x2, y2 = pts2[i]
+            
+            A = np.array([
+                x1 * P1[2] - P1[0],
+                y1 * P1[2] - P1[1],
+                x2 * P2[2] - P2[0],
+                y2 * P2[2] - P2[1]
+            ])
+            
+            # Solve using SVD
+            _, _, Vt = np.linalg.svd(A)
+            X = Vt[-1]
+            X = X / X[3]  # Normalize homogeneous coordinates
+            
+            points_3d.append(X[:3])
+        
+        return np.array(points_3d)
     
     def check_cheirality(self, points_3d, R, t):
         """Check if points are in front of both cameras"""
-        # Check first camera (identity)
         depth1 = points_3d[:, 2]
         
-        # Check second camera with safe computation
         with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
             points_cam2 = (R @ points_3d.T).T + t.ravel()
             depth2 = points_cam2[:, 2]
         
-        # Both depths should be positive and reasonable
-        # Also check for inf/nan
         valid = (depth1 > 0) & (depth2 > 0) & \
                 (depth1 < 1000) & (depth2 < 1000) & \
                 np.isfinite(depth1) & np.isfinite(depth2)
         return valid
     
+    def normalize_scale(self, points_3d, target_median_depth=10.0):
+        """
+        FIX: Normalize scale to consistent metric
+        Essential matrix gives unit translation - need to fix scale
+        """
+        depths = points_3d[:, 2]
+        valid_depths = depths[(depths > 0) & (depths < 1000)]
+        
+        if len(valid_depths) == 0:
+            return points_3d, 1.0
+        
+        current_median = np.median(valid_depths)
+        scale_factor = target_median_depth / current_median
+        
+        return points_3d * scale_factor, scale_factor
+    
     def initialize_reconstruction(self, img1, img2, pts1, pts2, matches, kp1, kp2):
         """
-        Initialize reconstruction from first two views
-        Implements: 8-point algorithm + triangulation
+        Lecture 8: Initialize SfM from two views
+        
+        Steps:
+        1. Estimate Essential Matrix (5-point algorithm)
+        2. Recover R, t (4 solutions -> test cheirality)
+        3. Triangulate initial points
+        4. CRITICAL: Normalize scale for consistency
         """
         print("Initializing reconstruction...")
         print(f"  Input: {len(pts1)} matched points")
         
-        # Get camera intrinsics
         K = self.initialize_intrinsics(img1.shape)
         print(f"  Camera intrinsics: f={K[0,0]:.1f}, cx={K[0,2]:.1f}, cy={K[1,2]:.1f}")
         
-        # Estimate pose
+        # Step 1-2: Essential Matrix + Pose Recovery
         R, t, mask = self.estimate_pose_from_essential(pts1, pts2, K)
         
         if R is None:
@@ -133,7 +154,6 @@ class SfMModel:
         mask_bool = mask.ravel().astype(bool) if mask.dtype != bool else mask.ravel()
         print(f"  Pose estimation inliers: {mask_bool.sum()} / {len(mask_bool)}")
         
-        # Filter by inliers
         pts1_inlier = pts1[mask_bool]
         pts2_inlier = pts2[mask_bool]
         matches_inlier = [m for i, m in enumerate(matches) if mask_bool[i]]
@@ -142,14 +162,12 @@ class SfMModel:
             print(f"  Too few inliers: {len(pts1_inlier)}")
             return False
         
-        # Set up projection matrices
+        # Step 3: Triangulate
         P1 = K @ np.hstack([np.eye(3), np.zeros((3, 1))])
         P2 = K @ np.hstack([R, t])
         
-        # Triangulate ONLY inlier points
-        points_3d = self.triangulate_points(pts1_inlier, pts2_inlier, P1, P2)
+        points_3d = self.triangulate_points_dlt(pts1_inlier, pts2_inlier, P1, P2)
         
-        # Check cheirality
         valid_3d = self.check_cheirality(points_3d, R, t)
         print(f"  Cheirality check: {valid_3d.sum()} / {len(valid_3d)} valid")
         
@@ -157,145 +175,254 @@ class SfMModel:
             print(f"  ERROR: Only {valid_3d.sum()} valid 3D points")
             return False
         
+        # CRITICAL FIX: Normalize scale
+        points_3d_valid = points_3d[valid_3d]
+        points_3d_normalized, scale_factor = self.normalize_scale(points_3d_valid)
+        
+        # Scale translation accordingly
+        t_scaled = t * scale_factor
+        
+        print(f"  Scale normalization: factor={scale_factor:.3f}")
+        print(f"  Depth range: [{points_3d_normalized[:, 2].min():.2f}, {points_3d_normalized[:, 2].max():.2f}]")
+        
         # Store cameras
         self.cameras[0] = {'R': np.eye(3), 't': np.zeros((3, 1)), 'K': K}
-        self.cameras[1] = {'R': R, 't': t, 'K': K}
+        self.cameras[1] = {'R': R, 't': t_scaled, 'K': K}
         self.registered_images = {0, 1}
         
-        # Store 3D points with 2D coordinates
+        # Store 3D points
+        valid_idx = 0
         for i in range(len(points_3d)):
-            if valid_3d[i]:
-                match = matches_inlier[i]
-                kp_idx1 = match.queryIdx
-                kp_idx2 = match.trainIdx
+            if not valid_3d[i]:
+                continue
                 
-                # Get 2D coordinates
-                pt2d_1 = pts1_inlier[i]
-                pt2d_2 = pts2_inlier[i]
-                
-                # Get color
-                x, y = int(pt2d_1[0]), int(pt2d_1[1])
-                if 0 <= x < img1.shape[1] and 0 <= y < img1.shape[0]:
-                    color = img1[y, x]
-                    rgb = [int(color[2]), int(color[1]), int(color[0])]
-                else:
-                    rgb = [128, 128, 128]
-                
-                pt_id = self.next_point_id
-                self.points3D[pt_id] = {
-                    'xyz': points_3d[i],
-                    'rgb': np.array(rgb),
-                    # Modified: Store (cam_idx, kp_idx, pt2d) tuples
-                    'obs': [
-                        (0, kp_idx1, pt2d_1.copy()),
-                        (1, kp_idx2, pt2d_2.copy())
-                    ]
-                }
-                
-                # Optimization: Update index
-                self.kp_to_pt3d[(0, kp_idx1)] = pt_id
-                self.kp_to_pt3d[(1, kp_idx2)] = pt_id
-                
-                self.next_point_id += 1
+            match = matches_inlier[i]
+            kp_idx1 = match.queryIdx
+            kp_idx2 = match.trainIdx
+            
+            pt2d_1 = pts1_inlier[i]
+            pt2d_2 = pts2_inlier[i]
+            
+            x, y = int(pt2d_1[0]), int(pt2d_1[1])
+            if 0 <= x < img1.shape[1] and 0 <= y < img1.shape[0]:
+                color = img1[y, x]
+                rgb = [int(color[2]), int(color[1]), int(color[0])]
+            else:
+                rgb = [128, 128, 128]
+            
+            pt_id = self.next_point_id
+            self.points3D[pt_id] = {
+                'xyz': points_3d_normalized[valid_idx],
+                'rgb': np.array(rgb),
+                'obs': [
+                    (0, kp_idx1, pt2d_1.copy()),
+                    (1, kp_idx2, pt2d_2.copy())
+                ]
+            }
+            
+            self.kp_to_pt3d[(0, kp_idx1)] = pt_id
+            self.kp_to_pt3d[(1, kp_idx2)] = pt_id
+            
+            self.next_point_id += 1
+            valid_idx += 1
         
         print(f"  ✓ Initialized with {len(self.points3D)} 3D points\n")
         return True
     
-    def estimate_pose_pnp(self, points_3d, points_2d, K):
+    # ============================================================================
+    # 2. INCREMENTAL CAMERA REGISTRATION (Lecture 4: PnP)
+    # ============================================================================
+    
+    def estimate_pose_pnp_dlt(self, points_3d, points_2d, K):
         """
-        Estimate camera pose using PnP with RANSAC
-        Based on lecture: PnP solves for R,t given 3D-2D correspondences
-        """
-        # Convert to proper format
-        pts_3d = np.array([p for p in points_3d], dtype=np.float64)
-        pts_2d = np.array([p for p in points_2d], dtype=np.float64)
+        Lecture 4: PnP using DLT
         
-        if len(pts_3d) < 6:
+        Solve for projection matrix P = K[R|t], then decompose
+        Must implement ourselves (cv2.solvePnP not allowed for registration)
+        """
+        from scipy.optimize import least_squares
+        
+        pts_3d = np.array(points_3d, dtype=np.float64)
+        pts_2d = np.array(points_2d, dtype=np.float64)
+        n = len(pts_3d)
+        
+        if n < 6:
             return None, None, None
         
-        # Adaptive threshold based on image resolution
-        # Your images are 640x720, so use proportional threshold
-        image_diagonal = np.sqrt(640**2 + 720**2)  # ~961 pixels
-        
-        # Strategy 1: Start with relaxed threshold for initial registration
-        if len(self.cameras) <= 3:
-            # Early stage: more lenient to establish initial structure
-            reproj_threshold = max(12.0, image_diagonal * 0.015)  # ~14-15 pixels
-            min_inliers = 15
+        # Initial guess from existing cameras
+        if len(self.cameras) >= 2:
+            all_ts = [cam['t'].ravel() for cam in self.cameras.values()]
+            all_Rs = [cam['R'] for cam in self.cameras.values()]
+            
+            # Median camera position
+            median_t = np.median(all_ts, axis=0)
+            
+            # Average rotation
+            rvecs = [cv2.Rodrigues(R)[0].ravel() for R in all_Rs]
+            median_rvec = np.median(rvecs, axis=0)
+            R_init, _ = cv2.Rodrigues(median_rvec)
+            
+            rvec0 = median_rvec
+            tvec0 = median_t
         else:
-            # Later stage: can be more strict
-            reproj_threshold = max(8.0, image_diagonal * 0.01)  # ~9-10 pixels
-            min_inliers = 20
+            rvec0 = np.zeros(3)
+            tvec0 = np.array([0, 0, 10])
         
-        # Try multiple attempts with different parameters
-        best_inliers = None
+        x0 = np.hstack([rvec0, tvec0])
+        
+        # Reprojection error
+        def residuals(x):
+            rvec = x[:3]
+            tvec = x[3:6]
+            
+            try:
+                R, _ = cv2.Rodrigues(rvec)
+                
+                # Project: x = K[R|t]X
+                pts_cam = (R @ pts_3d.T).T + tvec
+                
+                # Filter behind camera
+                valid = pts_cam[:, 2] > 0.1
+                
+                errors = np.zeros(n * 2)
+                for i in range(n):
+                    if not valid[i]:
+                        errors[2*i:2*i+2] = 1000.0
+                        continue
+                    
+                    pt_proj = K @ pts_cam[i]
+                    u = pt_proj[0] / pt_proj[2]
+                    v = pt_proj[1] / pt_proj[2]
+                    
+                    errors[2*i] = pts_2d[i, 0] - u
+                    errors[2*i+1] = pts_2d[i, 1] - v
+                
+                return errors
+            except:
+                return np.ones(n * 2) * 1000.0
+        
+        # Optimize
+        try:
+            result = least_squares(
+                residuals, x0,
+                method='trf',
+                ftol=1e-4,
+                xtol=1e-4,
+                max_nfev=50,
+                verbose=0
+            )
+            
+            rvec_opt = result.x[:3]
+            tvec_opt = result.x[3:6]
+            
+            R, _ = cv2.Rodrigues(rvec_opt)
+            t = tvec_opt.reshape(3, 1)
+            
+            # Compute errors
+            errors = residuals(result.x).reshape(-1, 2)
+            errors = np.linalg.norm(errors, axis=1)
+            errors[errors > 500] = 1e6
+            
+            return R, t, errors
+        except:
+            return None, None, None
+    
+    def estimate_pose_pnp_ransac(self, points_3d, points_2d, K,
+                                  max_iterations=300):
+        """
+        RANSAC wrapper for PnP (Lecture 8)
+        """
+        pts_3d = np.array(points_3d, dtype=np.float64)
+        pts_2d = np.array(points_2d, dtype=np.float64)
+        n = len(pts_3d)
+        
+        if n < 6:
+            return None, None, None
+        
+        # Adaptive thresholds based on reconstruction maturity
+        if len(self.cameras) <= 3:
+            threshold = 15.0  # More lenient early on
+            min_inliers = 15
+            sample_size = 8
+        else:
+            threshold = 10.0
+            min_inliers = 20
+            sample_size = 6
+        
+        print(f"  Running PnP-RANSAC (DLT-based)...")
+        print(f"    Points: {n}, Threshold: {threshold:.1f}px, Sample: {sample_size}")
+        
         best_R = None
         best_t = None
+        best_inliers = None
         max_inlier_count = 0
         
-        # Attempt 1: Relaxed threshold
-        success, rvec, tvec, inliers = cv2.solvePnPRansac(
-            pts_3d, pts_2d, K, None,
-            iterationsCount=2000,  # Increased from 1000
-            reprojectionError=reproj_threshold,
-            confidence=0.999,  # Higher confidence
-            flags=cv2.SOLVEPNP_EPNP
-        )
-        
-        if success and inliers is not None and len(inliers) >= min_inliers:
-            best_inliers = inliers
-            best_R, _ = cv2.Rodrigues(rvec)
-            best_t = tvec
-            max_inlier_count = len(inliers)
-        
-        # Attempt 2: If first attempt failed or got few inliers, try even more relaxed
-        if max_inlier_count < len(pts_3d) * 0.3:  # Less than 30% inliers
-            success2, rvec2, tvec2, inliers2 = cv2.solvePnPRansac(
-                pts_3d, pts_2d, K, None,
-                iterationsCount=3000,
-                reprojectionError=reproj_threshold * 1.5,  # More relaxed
-                confidence=0.999,
-                flags=cv2.SOLVEPNP_ITERATIVE  # Try different solver
-            )
+        for i in range(max_iterations):
+            # Sample
+            indices = np.random.choice(n, min(sample_size, n), replace=False)
+            sample_3d = pts_3d[indices]
+            sample_2d = pts_2d[indices]
             
-            if success2 and inliers2 is not None and len(inliers2) > max_inlier_count:
-                best_inliers = inliers2
-                best_R, _ = cv2.Rodrigues(rvec2)
-                best_t = tvec2
-                max_inlier_count = len(inliers2)
+            # Estimate
+            R, t, _ = self.estimate_pose_pnp_dlt(sample_3d, sample_2d, K)
+            
+            if R is None:
+                continue
+            
+            # Test all
+            _, _, errors = self.estimate_pose_pnp_dlt(pts_3d, pts_2d, K)
+            
+            if errors is None:
+                continue
+            
+            # Count inliers
+            inliers = errors < threshold
+            inlier_count = np.sum(inliers)
+            
+            if inlier_count > max_inlier_count:
+                max_inlier_count = inlier_count
+                best_R = R
+                best_t = t
+                best_inliers = inliers
+            
+            # Early stop
+            if inlier_count > n * 0.5:
+                break
         
-        # Return best result
-        if best_R is None:
+        if best_R is None or max_inlier_count < min_inliers:
+            print(f"    Failed: {max_inlier_count}/{n} inliers (need {min_inliers})")
             return None, None, None
         
-        # Refine with inliers only (non-linear optimization)
-        if max_inlier_count >= min_inliers:
-            inlier_pts_3d = pts_3d[best_inliers.ravel()]
-            inlier_pts_2d = pts_2d[best_inliers.ravel()]
-            
-            # Final refinement with iterative method
-            rvec_refined, _ = cv2.Rodrigues(best_R)
-            success_refine, rvec_final, tvec_final = cv2.solvePnP(
-                inlier_pts_3d, inlier_pts_2d, K, None,
-                rvec=rvec_refined, tvec=best_t,
-                useExtrinsicGuess=True,
-                flags=cv2.SOLVEPNP_ITERATIVE
-            )
-            
-            if success_refine:
-                R_final, _ = cv2.Rodrigues(rvec_final)
-                return R_final, tvec_final.reshape(3, 1), best_inliers.ravel()
+        # Refine with all inliers
+        inlier_pts_3d = pts_3d[best_inliers]
+        inlier_pts_2d = pts_2d[best_inliers]
         
-        return best_R, best_t.reshape(3, 1), best_inliers.ravel()
+        R_refined, t_refined, _ = self.estimate_pose_pnp_dlt(
+            inlier_pts_3d, inlier_pts_2d, K
+        )
         
+        if R_refined is not None:
+            best_R = R_refined
+            best_t = t_refined
+            
+            # Recompute inliers
+            _, _, errors_final = self.estimate_pose_pnp_dlt(pts_3d, pts_2d, K)
+            if errors_final is not None:
+                best_inliers = errors_final < threshold
+                max_inlier_count = np.sum(best_inliers)
+        
+        inlier_ratio = max_inlier_count / n * 100
+        print(f"    Success: {max_inlier_count}/{n} inliers ({inlier_ratio:.1f}%)")
+        
+        return best_R, best_t, np.where(best_inliers)[0]
+    
     def register_new_image(self, img_idx, img, keypoints, matches_dict, loader):
         """
-        Register new image to existing reconstruction
-        Implements: PnP + RANSAC + triangulation of new points
+        Lecture 8: Add new camera to reconstruction
         """
         print(f"Registering image {img_idx}...")
         
-        # Optimization: Use pre-built index
+        # Collect 3D-2D correspondences
         points_3d = []
         points_2d = []
         point_ids = []
@@ -316,27 +443,26 @@ class SfMModel:
                     idx_new = m.trainIdx
                     idx_reg = m.queryIdx
                 
-                # Optimization: O(1) lookup
                 key = (reg_idx, idx_reg)
                 if key in self.kp_to_pt3d:
                     pt_id = self.kp_to_pt3d[key]
                     
-                    if pt_id not in point_ids:  # Prevent duplicates
+                    if pt_id not in point_ids:
                         points_3d.append(self.points3D[pt_id]['xyz'])
-                        pt2d = keypoints[idx_new].pt  # This is a tuple (x, y)
+                        pt2d = keypoints[idx_new].pt
                         points_2d.append(pt2d)
                         point_ids.append(pt_id)
                         kp_indices.append(idx_new)
         
         if len(points_3d) < 6:
-            print(f"  Not enough 3D-2D correspondences: {len(points_3d)}")
+            print(f"  Not enough correspondences: {len(points_3d)}")
             return False
         
         print(f"  Found {len(points_3d)} 3D-2D correspondences")
         
-        # Estimate pose using PnP
+        # PnP-RANSAC
         K = self.cameras[0]['K']
-        R, t, inliers = self.estimate_pose_pnp(points_3d, points_2d, K)
+        R, t, inliers = self.estimate_pose_pnp_ransac(points_3d, points_2d, K)
         
         if R is None:
             print("  Failed to estimate pose!")
@@ -348,19 +474,15 @@ class SfMModel:
         self.cameras[img_idx] = {'R': R, 't': t, 'K': K}
         self.registered_images.add(img_idx)
         
-        # Add observations for inlier points
+        # Add observations
         for inlier_idx in inliers:
             pt_id = point_ids[inlier_idx]
             kp_idx = kp_indices[inlier_idx]
-            pt2d = points_2d[inlier_idx]  # This is a tuple
+            pt2d = points_2d[inlier_idx]
             
-            # Convert tuple to numpy array for consistency
             pt2d_array = np.array(pt2d, dtype=np.float64)
             
-            # Add new observation to existing 3D point
             self.points3D[pt_id]['obs'].append((img_idx, kp_idx, pt2d_array))
-            
-            # Update index
             self.kp_to_pt3d[(img_idx, kp_idx)] = pt_id
         
         # Triangulate new points
@@ -369,33 +491,12 @@ class SfMModel:
         print(f"  Total 3D points: {len(self.points3D)}\n")
         return True
     
+    # ============================================================================
+    # 3. TRIANGULATION OF NEW POINTS (Lecture 6)
+    # ============================================================================
+    
     def _triangulate_new_points(self, new_idx, img, keypoints, matches_dict, loader):
-        """Triangulate new 3D points from newly registered image"""
-        
-        n_existing_points = len(self.points3D)
-        n_cameras = len(self.cameras)
-        
-        # Adaptive filtering based on reconstruction maturity
-        if n_cameras <= 3:
-            # Very early stage: Be very lenient
-            min_matches = 5
-            depth_threshold = 2000
-            reproj_threshold = 20.0  # Very lenient
-        elif n_cameras <= 6:
-            # Early stage: Still lenient
-            min_matches = 6
-            depth_threshold = 1500
-            reproj_threshold = 15.0  # Lenient
-        elif n_existing_points < 3000:
-            # Mid stage: Moderate
-            min_matches = 7
-            depth_threshold = 1200
-            reproj_threshold = 12.0  # Moderate
-        else:
-            # Late stage: More strict
-            min_matches = 8
-            depth_threshold = 1000
-            reproj_threshold = 10.0  # Strict
+        """Lecture 6: Triangulate new 3D points"""
         
         K = self.cameras[new_idx]['K']
         R_new = self.cameras[new_idx]['R']
@@ -403,6 +504,7 @@ class SfMModel:
         P_new = K @ np.hstack([R_new, t_new])
         
         added_count = 0
+        reproj_threshold = 8.0
         
         for reg_idx in list(self.registered_images):
             if reg_idx == new_idx:
@@ -431,6 +533,7 @@ class SfMModel:
                     idx_new = m.trainIdx
                     idx_reg = m.queryIdx
                 
+                # Skip if already triangulated
                 if (new_idx, idx_new) in self.kp_to_pt3d or (reg_idx, idx_reg) in self.kp_to_pt3d:
                     continue
                 
@@ -442,92 +545,77 @@ class SfMModel:
                 kp_idx_new.append(idx_new)
                 kp_idx_reg.append(idx_reg)
             
-            if len(pts_new) < min_matches:
+            if len(pts_new) < 5:
                 continue
             
             pts_new = np.array(pts_new, dtype=np.float32)
             pts_reg = np.array(pts_reg, dtype=np.float32)
             
-            points_3d = self.triangulate_points(pts_new, pts_reg, P_new, P_reg)
+            # Triangulate
+            points_3d = self.triangulate_points_dlt(pts_new, pts_reg, P_new, P_reg)
             
-            # Multi-stage validation
-            valid_indices = []
-            
-            # Pre-compute rotation vectors (once per registered camera pair)
-            rvec_new, _ = cv2.Rodrigues(R_new)
-            rvec_reg, _ = cv2.Rodrigues(R_reg)
-            
+            # Validate
             for idx in range(len(points_3d)):
                 pt3d = points_3d[idx]
                 
-                # Stage 1: Basic depth check
-                depth_new = pt3d[2]
-                if depth_new <= 0 or depth_new > depth_threshold:
+                # Depth check
+                if pt3d[2] <= 0 or pt3d[2] > 1000:
                     continue
                 
-                # Stage 2: Check depth in registered camera
-                pt_cam_reg = R_reg @ pt3d.reshape(3, 1) + t_reg
-                depth_reg = pt_cam_reg[2, 0]
-                if depth_reg <= 0 or depth_reg > depth_threshold:
+                pt_cam_reg = R_reg @ pt3d + t_reg.ravel()
+                if pt_cam_reg[2] <= 0 or pt_cam_reg[2] > 1000:
                     continue
                 
-                # Stage 3: Reprojection error check (adaptive threshold)
-                pt2d_new_obs = pts_new[idx]
-                pt2d_reg_obs = pts_reg[idx]
+                # Reprojection check
+                pt_cam_new = R_new @ pt3d + t_new.ravel()
+                pt_img_new = K @ pt_cam_new
+                pt2d_new_proj = pt_img_new[:2] / pt_img_new[2]
                 
-                pt2d_new_proj = self._project_point(pt3d, rvec_new, t_new.ravel(), K)
-                pt2d_reg_proj = self._project_point(pt3d, rvec_reg, t_reg.ravel(), K)
+                pt_img_reg = K @ pt_cam_reg
+                pt2d_reg_proj = pt_img_reg[:2] / pt_img_reg[2]
                 
-                error_new = np.linalg.norm(pt2d_new_obs - pt2d_new_proj)
-                error_reg = np.linalg.norm(pt2d_reg_obs - pt2d_reg_proj)
+                error_new = np.linalg.norm(pts_new[idx] - pt2d_new_proj)
+                error_reg = np.linalg.norm(pts_reg[idx] - pt2d_reg_proj)
                 
-                # Use adaptive threshold
                 if error_new < reproj_threshold and error_reg < reproj_threshold:
-                    valid_indices.append(idx)
+                    # Add point
+                    x, y = int(pts_new[idx][0]), int(pts_new[idx][1])
+                    if 0 <= x < img.shape[1] and 0 <= y < img.shape[0]:
+                        color = img[y, x]
+                        rgb = [int(color[2]), int(color[1]), int(color[0])]
+                    else:
+                        rgb = [128, 128, 128]
+                    
+                    pt_id = self.next_point_id
+                    self.points3D[pt_id] = {
+                        'xyz': pt3d,
+                        'rgb': np.array(rgb),
+                        'obs': [
+                            (new_idx, kp_idx_new[idx], pts_new[idx].copy()),
+                            (reg_idx, kp_idx_reg[idx], pts_reg[idx].copy())
+                        ]
+                    }
+                    
+                    self.kp_to_pt3d[(new_idx, kp_idx_new[idx])] = pt_id
+                    self.kp_to_pt3d[(reg_idx, kp_idx_reg[idx])] = pt_id
+                    
+                    self.next_point_id += 1
+                    added_count += 1
+                    
+                    if added_count > 500:  # Limit per pair
+                        break
             
-            # Add valid points
-            for idx in valid_indices:
-                if n_existing_points + added_count > 10000:  # Increased limit
-                    print(f"  Point limit reached ({n_existing_points + added_count}), stopping triangulation")
-                    return
-                
-                pt3d = points_3d[idx]
-                pt2d_new = pts_new[idx]
-                pt2d_reg = pts_reg[idx]
-                
-                x, y = int(pt2d_new[0]), int(pt2d_new[1])
-                if 0 <= x < img.shape[1] and 0 <= y < img.shape[0]:
-                    color = img[y, x]
-                    rgb = [int(color[2]), int(color[1]), int(color[0])]
-                else:
-                    rgb = [128, 128, 128]
-                
-                pt_id = self.next_point_id
-                self.points3D[pt_id] = {
-                    'xyz': pt3d,
-                    'rgb': np.array(rgb),
-                    'obs': [
-                        (new_idx, kp_idx_new[idx], pt2d_new.copy()),
-                        (reg_idx, kp_idx_reg[idx], pt2d_reg.copy())
-                    ]
-                }
-                
-                self.kp_to_pt3d[(new_idx, kp_idx_new[idx])] = pt_id
-                self.kp_to_pt3d[(reg_idx, kp_idx_reg[idx])] = pt_id
-                
-                self.next_point_id += 1
-                added_count += 1
-        
+            if added_count > 500:
+                break
+    
+    # ============================================================================
+    # 4. BUNDLE ADJUSTMENT (Lecture 8: Non-linear refinement)
+    # ============================================================================
+    
     def bundle_adjustment(self, optimize_intrinsics=True):
         """
-        Bundle Adjustment: Jointly optimize camera poses, 3D points, and intrinsics
-        
-        Minimizes reprojection error: Σ ||x_observed - proj(K, R, t, X)||²
-        
-        Based on lecture: Non-linear refinement of structure and motion
-        
-        Args:
-            optimize_intrinsics: If True, also optimize focal length and principal point
+        Lecture 8: Bundle Adjustment
+        Minimize: Σ ||x_ij - proj(X_j, P_i)||²
         """
         print("Running bundle adjustment...")
         
@@ -541,23 +629,19 @@ class SfMModel:
         point_indices = list(self.points3D.keys())
         
         print(f"  Cameras: {n_cameras}, Points: {n_points}")
-        print(f"  Optimize intrinsics: {optimize_intrinsics}")
         
-        # Create index mappings
+        # Mappings
         cam_idx_map = {idx: i for i, idx in enumerate(cam_indices)}
         pt_idx_map = {idx: i for i, idx in enumerate(point_indices)}
         
-        # ========== Prepare initial parameters ==========
+        # Parameters
         K = self.cameras[cam_indices[0]]['K']
         
         if optimize_intrinsics:
-            # Intrinsic parameters: [focal, cx, cy]
-            # Assume square pixels (fx = fy) and zero skew
             intrinsic_params = [K[0, 0], K[0, 2], K[1, 2]]
         else:
             intrinsic_params = []
         
-        # Camera extrinsics: [rvec (3), tvec (3)] for each camera
         camera_params = []
         for cam_idx in cam_indices:
             cam = self.cameras[cam_idx]
@@ -565,20 +649,13 @@ class SfMModel:
             camera_params.extend(rvec.ravel())
             camera_params.extend(cam['t'].ravel())
         
-        # 3D point positions: [x, y, z] for each point
         point_params = []
         for pt_id in point_indices:
             point_params.extend(self.points3D[pt_id]['xyz'])
         
-        # Combine all parameters into single vector
         x0 = np.hstack([intrinsic_params, camera_params, point_params])
         
-        print(f"  Total parameters: {len(x0)}")
-        print(f"    - Intrinsics: {len(intrinsic_params)}")
-        print(f"    - Camera params: {len(camera_params)}")
-        print(f"    - Point params: {len(point_params)}")
-        
-        # ========== Collect observations ==========
+        # Observations
         observations = []
         for pt_id in point_indices:
             pt_data = self.points3D[pt_id]
@@ -601,20 +678,8 @@ class SfMModel:
             print("  Skipping: too few observations\n")
             return
         
-        # Convert observations to arrays for vectorization
-        obs_cam_indices = np.array([obs['cam_idx'] for obs in observations], dtype=np.int32)
-        obs_pt_indices = np.array([obs['pt_idx'] for obs in observations], dtype=np.int32)
-        obs_pt2d = np.array([obs['pt2d'] for obs in observations], dtype=np.float64)
-        
-        # ========== Define residual function ==========
+        # Residual function
         def residuals(params):
-            """
-            Compute reprojection errors for all observations
-            
-            Returns:
-                residuals: 2D array of shape (n_obs * 2,) containing x and y errors
-            """
-            # Parse parameters
             if optimize_intrinsics:
                 focal = params[0]
                 cx = params[1]
@@ -630,48 +695,34 @@ class SfMModel:
             cam_params = params[cam_start:cam_start + n_cam_params].reshape(n_cameras, 6)
             pt_params = params[cam_start + n_cam_params:].reshape(n_points, 3)
             
-            rvecs = cam_params[:, :3]
-            tvecs = cam_params[:, 3:6]
+            residuals_list = []
             
-            # Precompute rotation matrices
-            R_matrices = np.zeros((n_cameras, 3, 3))
-            for i in range(n_cameras):
-                R_matrices[i], _ = cv2.Rodrigues(rvecs[i])
+            for obs in observations:
+                cam_id = obs['cam_idx']
+                pt_id = obs['pt_idx']
+                pt2d_obs = obs['pt2d']
+                
+                rvec = cam_params[cam_id, :3]
+                tvec = cam_params[cam_id, 3:6]
+                pt3d = pt_params[pt_id]
+                
+                # Project
+                R, _ = cv2.Rodrigues(rvec)
+                pt_cam = R @ pt3d + tvec
+                
+                if pt_cam[2] <= 0:
+                    residuals_list.extend([1000.0, 1000.0])
+                    continue
+                
+                u = focal * pt_cam[0] / pt_cam[2] + cx
+                v = focal * pt_cam[1] / pt_cam[2] + cy
+                
+                residuals_list.append(pt2d_obs[0] - u)
+                residuals_list.append(pt2d_obs[1] - v)
             
-            # Vectorized projection
-            cam_ids = obs_cam_indices
-            pt_ids = obs_pt_indices
-            
-            Rs = R_matrices[cam_ids]  # (n_obs, 3, 3)
-            ts = tvecs[cam_ids]       # (n_obs, 3)
-            pts3d = pt_params[pt_ids] # (n_obs, 3)
-            
-            # Transform to camera coordinates: p_cam = R @ p_world + t
-            pts_cam = np.einsum('nij,nj->ni', Rs, pts3d) + ts
-            
-            # Handle points behind camera
-            behind_camera = pts_cam[:, 2] <= 0
-            pts_cam[behind_camera, 2] = 1e-6  # Avoid division by zero
-            
-            # Perspective projection
-            x_norm = pts_cam[:, 0] / pts_cam[:, 2]
-            y_norm = pts_cam[:, 1] / pts_cam[:, 2]
-            
-            # Apply intrinsics
-            u_proj = focal * x_norm + cx
-            v_proj = focal * y_norm + cy
-            
-            pts2d_proj = np.column_stack([u_proj, v_proj])
-            
-            # Compute residuals
-            residuals = (obs_pt2d - pts2d_proj).ravel()
-            
-            # Penalize points behind camera
-            residuals[np.repeat(behind_camera, 2)] = 1000.0
-            
-            return residuals
+            return np.array(residuals_list)
         
-        # ========== Run optimization ==========
+        # Optimize
         print(f"  Running optimization...")
         import time
         start_time = time.time()
@@ -682,13 +733,13 @@ class SfMModel:
             method='trf',
             ftol=1e-4,
             xtol=1e-4,
-            max_nfev=100,
+            max_nfev=30,  # Limited for speed
             verbose=0
         )
         
         elapsed = time.time() - start_time
         
-        # ========== Report results ==========
+        # Report
         initial_cost = np.sum(residuals(x0)**2)
         final_cost = np.sum(result.fun**2)
         improvement = (1 - final_cost/initial_cost) * 100 if initial_cost > 0 else 0
@@ -697,10 +748,9 @@ class SfMModel:
         print(f"  Initial cost: {initial_cost:.2f}")
         print(f"  Final cost: {final_cost:.2f} ({improvement:.1f}% improvement)")
         print(f"  Mean reprojection error: {mean_reproj_error:.3f} pixels")
-        print(f"  Iterations: {result.nfev}")
         print(f"  Time: {elapsed:.2f}s")
         
-        # ========== Update model with optimized parameters ==========
+        # Update model
         if optimize_intrinsics:
             focal_opt = result.x[0]
             cx_opt = result.x[1]
@@ -710,14 +760,10 @@ class SfMModel:
                 [focal_opt, 0, cx_opt],
                 [0, focal_opt, cy_opt],
                 [0, 0, 1]
-            ], dtype=np.float64)
+            ])
             
-            print(f"  Intrinsics refinement:")
-            print(f"    focal: {K[0,0]:.1f} → {focal_opt:.1f}")
-            print(f"    cx: {K[0,2]:.1f} → {cx_opt:.1f}")
-            print(f"    cy: {K[1,2]:.1f} → {cy_opt:.1f}")
+            print(f"  Intrinsics: f={K[0,0]:.1f}→{focal_opt:.1f}")
             
-            # Update all cameras with refined intrinsics
             for cam_idx in cam_indices:
                 self.cameras[cam_idx]['K'] = K_opt.copy()
             
@@ -725,7 +771,7 @@ class SfMModel:
         else:
             cam_start = 0
         
-        # Update camera extrinsics
+        # Update cameras
         n_cam_params = n_cameras * 6
         optimized_cam_params = result.x[cam_start:cam_start + n_cam_params].reshape(n_cameras, 6)
         
@@ -736,66 +782,36 @@ class SfMModel:
             self.cameras[cam_idx]['R'] = R
             self.cameras[cam_idx]['t'] = tvec.reshape(3, 1)
         
-        # Update 3D points
+        # Update points
         optimized_pt_params = result.x[cam_start + n_cam_params:].reshape(n_points, 3)
         for i, pt_id in enumerate(point_indices):
             self.points3D[pt_id]['xyz'] = optimized_pt_params[i]
         
-        print("  Bundle adjustment completed\n")
-            
-    def _project_point(self, pt3d, rvec, tvec, K):
-        """
-        Project 3D point to 2D image plane
-        Based on lecture: x = K[R|t]X
-        
-        Args:
-            pt3d: 3D point in world coordinates (3,)
-            rvec: Rotation vector (3,)
-            tvec: Translation vector (3,)
-            K: Camera intrinsics matrix (3, 3)
-        
-        Returns:
-            pt2d: Projected 2D point (2,)
-        """
-        # Convert rotation vector to matrix
-        R, _ = cv2.Rodrigues(rvec)
-        
-        # Transform point to camera coordinates
-        pt_cam = R @ pt3d.reshape(3, 1) + tvec.reshape(3, 1)
-        
-        # Project to image plane
-        pt_img = K @ pt_cam
-        
-        # Normalize by depth
-        pt2d = (pt_img[:2] / pt_img[2]).ravel()
-        
-        return pt2d
+        print("  ✓ Bundle adjustment completed\n")
+    
+    # ============================================================================
+    # SAVE & VISUALIZE
+    # ============================================================================
     
     def save_results(self, output_dir):
-        """Save reconstruction results in COLMAP format"""
+        """Save results"""
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Save cameras.txt
         with open(output_dir / 'cameras.txt', 'w') as f:
-            f.write("# Camera list with one line of data per camera:\n")
-            f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+            f.write("# Camera list\n")
             if self.cameras:
                 K = self.cameras[0]['K']
-                f.write(f"1 OPENCV 640 480 {K[0,0]} {K[1,1]} {K[0,2]} {K[1,2]} 0 0 0 0\n")
+                f.write(f"1 OPENCV 640 720 {K[0,0]} {K[1,1]} {K[0,2]} {K[1,2]} 0 0 0 0\n")
         
-        # Save images.txt
         with open(output_dir / 'images.txt', 'w') as f:
-            f.write("# Image list with two lines of data per image:\n")
-            f.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
-            f.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
+            f.write("# Image list\n")
             
             for img_idx in sorted(self.cameras.keys()):
                 cam = self.cameras[img_idx]
                 R = cam['R']
                 t = cam['t'].ravel()
                 
-                # Convert rotation matrix to quaternion
                 rvec, _ = cv2.Rodrigues(R)
                 angle = np.linalg.norm(rvec)
                 if angle > 0:
@@ -805,25 +821,20 @@ class SfMModel:
                 else:
                     qw, qx, qy, qz = 1, 0, 0, 0
                 
-                f.write(f"{img_idx+1} {qw} {qx} {qy} {qz} {t[0]} {t[1]} {t[2]} 1 image_{img_idx:04d}.jpg\n")
-                f.write("\n")
+                f.write(f"{img_idx+1} {qw} {qx} {qy} {qz} {t[0]} {t[1]} {t[2]} 1 img_{img_idx:04d}.jpg\n\n")
         
-        # Save points3D.txt
         with open(output_dir / 'points3D.txt', 'w') as f:
-            f.write("# 3D point list with one line of data per point:\n")
-            f.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
+            f.write("# 3D point list\n")
             
             for pt_id, pt_data in self.points3D.items():
                 xyz = pt_data['xyz']
                 rgb = pt_data['rgb']
                 f.write(f"{pt_id} {xyz[0]} {xyz[1]} {xyz[2]} {rgb[0]} {rgb[1]} {rgb[2]} 0.0")
                 
-                # Modified: obs now has (cam_idx, kp_idx, pt2d) format
                 for cam_idx, kp_idx, pt2d in pt_data['obs']:
                     f.write(f" {cam_idx+1} 0")
                 f.write("\n")
         
-        # Save vis.txt (visualization format)
         with open(output_dir / 'vis.txt', 'w') as f:
             for pt_data in self.points3D.values():
                 xyz = pt_data['xyz']
@@ -833,68 +844,34 @@ class SfMModel:
         print(f"Results saved to {output_dir}/")
     
     def visualize(self, output_dir):
-        """Create visualization matching COLMAP example style"""
+        """Create visualization"""
         output_dir = Path(output_dir)
         
-        # Check if vis.txt exists and has data
         vis_file = output_dir / 'vis.txt'
-        if not vis_file.exists() or vis_file.stat().st_size == 0:
-            print("No 3D points to visualize - skipping visualization")
+        if not vis_file.exists():
             return
         
-        # Load vis.txt
         try:
             data = np.loadtxt(vis_file)
-            if data.ndim == 1 or len(data) == 0:
-                print("Not enough 3D points to visualize - skipping visualization")
+            if len(data) == 0:
                 return
-        except Exception as e:
-            print(f"Error loading visualization data: {e}")
+        except:
             return
         
         points = data[:, :3]
         colors = data[:, 3:6] / 255.0
         
-        # Create figure
         fig = plt.figure(figsize=(12, 10))
-        fig.patch.set_facecolor('#2d3561')
-        
         ax = fig.add_subplot(111, projection='3d')
-        ax.set_facecolor('#2d3561')
         
-        # Plot points
         ax.scatter(points[:, 0], points[:, 1], points[:, 2],
                   c=colors, s=1, alpha=0.6)
         
-        # Add reference circles
-        center = np.mean(points, axis=0)
-        theta = np.linspace(0, 2*np.pi, 100)
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
         
-        for i, j, k in [(0,1,2), (0,2,1), (1,2,0)]:
-            radius = np.std(points[:, [i,j]]) * 2
-            circle = np.zeros((100, 3))
-            circle[:, i] = center[i] + radius * np.cos(theta)
-            circle[:, j] = center[j] + radius * np.sin(theta)
-            circle[:, k] = center[k]
-            ax.plot(circle[:, 0], circle[:, 1], circle[:, 2],
-                   'w-', alpha=0.3, linewidth=1)
-        
-        # Styling
-        ax.set_xlabel('X', color='white')
-        ax.set_ylabel('Y', color='white')
-        ax.set_zlabel('Z', color='white')
-        ax.tick_params(colors='white')
-        
-        for pane in [ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane]:
-            pane.fill = False
-            pane.set_edgecolor('white')
-        
-        ax.grid(True, alpha=0.2, color='white')
-        ax.view_init(elev=20, azim=45)
-        
-        plt.tight_layout()
-        plt.savefig(output_dir / 'visualization.png', dpi=300,
-                   bbox_inches='tight', facecolor='#2d3561')
+        plt.savefig(output_dir / 'visualization.png', dpi=150)
         plt.close()
         
-        print(f"Visualization saved to {output_dir}/visualization.png")
+        print(f"Visualization saved")
